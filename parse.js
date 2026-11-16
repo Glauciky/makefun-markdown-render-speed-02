@@ -287,6 +287,9 @@ const R = {
 // mismatches on all of them): 149 ms. Exactly equivalent to the eight
 // includes() patterns '\n-','\n -','\n  -','\n   -','\n=','\n =',
 // '\n  =','\n   =' (0-3 spaces then `=`/`-` after a newline).
+// Blank-line stop: lheading's paragraph part cannot cross a blank line
+// (its \n alternative forbids \s*?\n), so a setext line past the first
+// blank line is unusable — stop scanning there instead of at EOF.
 function hasSetextGuard(src) {
   let i = src.indexOf('\n');
   while (i !== -1) {
@@ -295,7 +298,12 @@ function hasSetextGuard(src) {
     while (sp < 3 && src[j] === ' ') { j++; sp++; }
     const c = src[j];
     if (c === '=' || c === '-') return true;
-    i = src.indexOf('\n', j);
+    // Blank line (only spaces/tabs to end of line/string) ends the
+    // paragraph: no setext line past it can be used by lheading.
+    let k = j;
+    while (src[k] === ' ' || src[k] === '\t') k++;
+    if (src[k] === '\n' || k >= src.length) return false;
+    i = src.indexOf('\n', k);
   }
   return false;
 }
@@ -583,7 +591,12 @@ I.punctuation = rx(/^((?![*_])punctSpace)/, 'u').replace(/punctSpace/g, PUNCT_SP
 
 // Email-local characters for textScan (must match the
 // [a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-] class of the old I.text regex).
-const TEXT_EMAIL_CHARS = new Set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&\'*+/=?_`{|}~-'.split(''));
+// A Uint8Array indexed by char code beats Set.has in the hot backward /
+// forward scans (micro-benchmark on 21k real lines: 417 ms vs 1598 ms).
+// Email chars are all ASCII, so codes >= 128 are never email chars.
+const EMAIL_CHAR_TABLE = new Uint8Array(128);
+for (const ch of 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&\'*+/=?_`{|}~-') EMAIL_CHAR_TABLE[ch.charCodeAt(0)] = 1;
+function isEmailCharCode(cc) { return cc < 128 && EMAIL_CHAR_TABLE[cc] === 1; }
 
 // Manual scanner for inline text runs: returns the length of the plain-text
 // run at the start of src (always >= 1 for non-empty src). Mirrors the old
@@ -609,13 +622,13 @@ const STOP_RE = /([\\<!\[`*~_])|(www\.)|([hH][tT][tT][pP][sS]?)|([fF][tT][pP]:\/
 // run, so candidates at email-char positions must check this first.
 function emailStopContaining(src, t, p) {
   let r = t;
-  while (r > 0 && TEXT_EMAIL_CHARS.has(src[r - 1])) r--;
+  while (r > 0 && isEmailCharCode(src.charCodeAt(r - 1))) r--;
   // If the run starts at t, its stop is t itself — no improvement over
   // the candidate, so the forward scan is pointless. (Common case: the
   // trigger is preceded by a space or the run start.)
   if (r === t) return t;
   let a = t;
-  while (a < src.length && TEXT_EMAIL_CHARS.has(src[a])) a++;
+  while (a < src.length && isEmailCharCode(src.charCodeAt(a))) a++;
   if (src[a] !== '@') return Infinity;
   return r >= p ? r : p;
 }
@@ -669,7 +682,7 @@ function textScan(src) {
     if (m[4] !== undefined) { const es = emailStopContaining(src, i, p); if (es < i) return es; return i; }
     if (m[5] !== undefined) {
       let r = i;
-      while (r > 0 && TEXT_EMAIL_CHARS.has(src[r - 1])) r--;
+      while (r > 0 && isEmailCharCode(src.charCodeAt(r - 1))) r--;
       if (r < i) {
         if (r >= p) return r;
         if (p < i) return p;
@@ -1138,7 +1151,7 @@ class Tokenizer {
     if (s[4] && prev.match(/[\p{L}\p{N}]/u)) return null;
     const d = s[1] || s[3] || '';
     if (!d || !prev || u) {
-      let k = cpLen(s[0]) - 1; // open run length - 1
+      let k = s[0].length - 1; // open run length - 1 (run is only '*'/'_', ASCII, so cpLen == length)
       let g, b, m = k, f = 0;
       const y = i - l + k;
       const R = !!p.trim() && (!!d || (r === '*' && !h));
@@ -1395,7 +1408,7 @@ class Lexer {
   get links() { return this.tokens.links; }
 
   lex(src) {
-    src = src.replace(/\r\n?/g, '\n');
+    if (src.includes('\r')) src = src.replace(/\r\n?/g, '\n');
     this.blockTokens(src, this.tokens);
     for (let i = 0; i < this.inlineQueue.length; i++) {
       const q = this.inlineQueue[i];
