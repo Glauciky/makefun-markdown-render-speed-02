@@ -139,6 +139,59 @@ function expandTabs(s, col) {
   return out;
 }
 
+// Fast code-point length (no allocation): counts surrogate pairs as one
+// code point, exactly like [...s].length.
+function cpLen(s) {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xDC00 && d <= 0xDFFF) i++;
+    }
+    n++;
+  }
+  return n;
+}
+
+// UTF-16 length of the first code point of s (1, or 2 for an astral char),
+// i.e. [...s][0].length without the allocation.
+function firstCpLen(s) {
+  if (s.length === 0) return 0;
+  const c = s.charCodeAt(0);
+  return (c >= 0xD800 && c <= 0xDBFF && s.length > 1
+    && s.charCodeAt(1) >= 0xDC00 && s.charCodeAt(1) <= 0xDFFF) ? 2 : 1;
+}
+
+// The last code point ending at index `end` of s ('' when end <= 0),
+// i.e. [...s.slice(0, end)].at(-1) without the allocation.
+function lastCp(s, end) {
+  if (end <= 0) return '';
+  const c = s.charCodeAt(end - 1);
+  if (c >= 0xDC00 && c <= 0xDFFF && end >= 2) {
+    const d = s.charCodeAt(end - 2);
+    if (d >= 0xD800 && d <= 0xDBFF) return s.slice(end - 2, end);
+  }
+  return s.charAt(end - 1);
+}
+
+// Lazily-cached last-closer index for one delimiter in a masked string.
+// `closers` is a per-inline-source cache ({star, und, tilde}, -2 = not yet
+// computed); the masked string never changes within one inline source, so
+// each delimiter's scan runs at most once instead of once per attempt.
+function closerAt(closers, masked, r) {
+  if (r === '*') {
+    if (closers.star === -2) closers.star = lastCloserIndex(masked, '*');
+    return closers.star;
+  }
+  if (r === '_') {
+    if (closers.und === -2) closers.und = lastCloserIndex(masked, '_');
+    return closers.und;
+  }
+  if (closers.tilde === -2) closers.tilde = lastCloserIndex(masked, '~');
+  return closers.tilde;
+}
+
 // Compensate a fenced code block's content for the opening fence's indent
 // (read from the start of the full fence match).
 function fenceIndent(text, raw) {
@@ -190,6 +243,11 @@ const R = {
   paragraph: null, // built below
   text: /^[^\n]+/,
 };
+
+// Setext-underline guard: a setext heading needs a line starting with
+// `=` or `-` (after 0-3 spaces). If no such line exists, R.lheading
+// provably cannot match.
+const SETEXT_GUARD = /\n {0,3}[=-]/;
 
 // HTML block: the 7 CommonMark conditions.
 R.html = rx(
@@ -615,10 +673,12 @@ class Tokenizer {
       const startIdx = consumed.call ? 0 : 0;
       const beforeLen = src0.length - rest.length;
       rest = rest.substring(t[0].length);
-      let firstLine = t[2].split('\n', 1)[0];
+      const nlFirst = t[2].indexOf('\n');
+      let firstLine = nlFirst === -1 ? t[2] : t[2].slice(0, nlFirst);
       const bullLen = t[1].length;
       let content = firstLine.replace(O.leadingSpaceTab, (v) => expandTabs(v, bullLen));
-      const nextLine = rest.split('\n', 1)[0];
+      const nlNext = rest.indexOf('\n');
+      const nextLine = nlNext === -1 ? rest : rest.slice(0, nlNext);
       let isEmpty = !content.trim();
       let indent = 0;
       if (isEmpty) indent = bullLen + 1;
@@ -640,11 +700,33 @@ class Tokenizer {
         const html = O.htmlBeginRegex(indent);
         const bq = O.blockquoteBeginRegex(indent);
         while (rest) {
-          const line = rest.split('\n', 1)[0];
-          let expanded;
-          if (expanded = line.replace(O.leadingSpaceTab, (v) => expandTabs(v, 0)),
-              fences.test(line) || heading.test(line) || html.test(line) || bq.test(line) || nextBullet.test(line) || hr.test(line)) break;
-          if (expanded.search(O.nonSpaceChar) >= indent || !line.trim()) {
+          const nl = rest.indexOf('\n');
+          const line = nl === -1 ? rest : rest.slice(0, nl);
+          // First non-space/tab char (the lexer already normalised \r
+          // away, so a line is blank exactly when it is only spaces/tabs).
+          let fns = 0;
+          while (fns < line.length && (line[fns] === ' ' || line[fns] === '\t')) fns++;
+          const blank = fns === line.length;
+          const fc = blank ? '' : line[fns];
+          // Expand leading tabs only when the line starts with space/tab.
+          const expanded = fns > 0
+            ? line.replace(O.leadingSpaceTab, (v) => expandTabs(v, 0)) : line;
+          // Each block-start regex can only match when the first
+          // non-space char is its marker; skip the ones that cannot match.
+          if (((fc === '`' || fc === '~') && fences.test(line))
+            || (fc === '#' && heading.test(line))
+            || (fc === '<' && html.test(line))
+            || (fc === '>' && bq.test(line))
+            || ((fc === '*' || fc === '+' || fc === '-' || (fc >= '0' && fc <= '9')) && nextBullet.test(line))
+            || ((fc === '-' || fc === '_' || fc === '*') && hr.test(line))) break;
+          // First non-space char of the expanded line (tabs are expanded
+          // to spaces, so this equals expanded.search(/[^ ]/)).
+          let expFns = fns;
+          if (expanded !== line) {
+            expFns = 0;
+            while (expFns < expanded.length && (expanded[expFns] === ' ' || expanded[expFns] === '\t')) expFns++;
+          }
+          if (expFns >= indent || blank) {
             itemText += '\n' + expanded.slice(indent);
           } else {
             if (isEmpty || content.replace(O.tabCharGlobal, '    ').search(O.nonSpaceChar) >= 4
@@ -653,8 +735,8 @@ class Tokenizer {
               ? '    ' + expanded.replace(/^ {0,3}/, '') : line;
             itemText += '\n' + setext;
           }
-          isEmpty = !line.trim();
-          rest = rest.substring(line.length + 1);
+          isEmpty = blank;
+          rest = nl === -1 ? '' : rest.slice(nl + 1);
           content = expanded.slice(indent);
         }
       }
@@ -866,7 +948,7 @@ class Tokenizer {
     return null;
   }
 
-  emStrong(src, masked, prev = '') {
+  emStrong(src, masked, prev = '', closers) {
     let s = I.emStrongLDelim.exec(src);
     if (!s || (!s[1] && !s[2] && !s[3] && !s[4])) return null;
     const r = s[0][0]; // '*' or '_'
@@ -874,20 +956,20 @@ class Tokenizer {
     let i = masked.length - src.length; // offset of src within masked
     let l = i;
     for (; l > 0 && masked[l - 1] === r;) l--;
-    const p = [...masked.slice(Math.max(0, l - 2), l)].at(-1) ?? '';
+    const p = lastCp(masked, l);
     const h = p === '*' || p === '_' || !!I.punctuation.exec(p);
     if (l < i) prev = p;
     const u = l < i ? h : !!I.punctuation.exec(prev);
     if (s[4] && prev.match(/[\p{L}\p{N}]/u)) return null;
     const d = s[1] || s[3] || '';
     if (!d || !prev || u) {
-      let k = [...s[0]].length - 1; // open run length - 1
+      let k = cpLen(s[0]) - 1; // open run length - 1
       let g, b, m = k, f = 0;
       const y = i - l + k;
       const R = !!p.trim() && (!!d || (r === '*' && !h));
       if (r !== '*' && r !== '_') return null;
       const closeRe = r === '*' ? I.emStrongRDelimAst : I.emStrongRDelimUnd;
-      const v = lastCloserIndex(masked, r);
+      const v = closerAt(closers, masked, r);
       const Q = masked.length - src.length + k;
       if (v < Q) return null;
       const t = masked.slice(-1 * src.length + k);
@@ -898,7 +980,7 @@ class Tokenizer {
         s = mm;
         g = s[1] || s[2] || s[3] || s[4] || s[5] || s[6];
         if (!g) continue;
-        b = [...g].length;
+        b = g.length;
         if (s[3] || s[4]) { m += b; continue; }
         else if (s[5] || s[6] || R) {
           if (prevIsDelim && (s[5] || s[6])) break;
@@ -906,7 +988,7 @@ class Tokenizer {
         }
         if (m -= b, m > 0) continue;
         b = Math.min(b, b + m + f);
-        const firstLen = [...s[0]][0].length;
+        const firstLen = firstCpLen(s[0]);
         const raw = src.slice(0, k + s.index + firstLen + b);
         if (Math.min(k, b) % 2) {
           const inner = raw.slice(1, -1);
@@ -934,14 +1016,14 @@ class Tokenizer {
   }
 
   // Strikethrough. `masked` and `prev` as in emStrong.
-  del(src, masked, prev = '') {
+  del(src, masked, prev = '', closers) {
     let s = I.delLDelim.exec(src);
     if (!s) return null;
     if (!(s[1] || '') || !prev || I.punctuation.exec(prev)) {
-      const o = [...s[0]].length - 1;
+      const o = cpLen(s[0]) - 1;
       let g, l, p = o;
       const closeRe = I.delRDelim;
-      const u = lastDelCloserIndex(masked);
+      const u = closerAt(closers, masked, '~');
       const d = masked.length - src.length + o;
       if (u < d) return null;
       const t = masked.slice(-1 * src.length + o);
@@ -951,11 +1033,11 @@ class Tokenizer {
         if (mm === null || mm.index > k) break;
         s = mm;
         g = s[1] || s[2] || s[3] || s[4] || s[5] || s[6];
-        if (!g || (l = [...g].length, l !== o)) continue;
+        if (!g || (l = g.length, l !== o)) continue;
         if (s[3] || s[4]) { p += l; continue; }
         if (p -= l, p > 0) continue;
         l = Math.min(l, l + p);
-        const firstLen = [...s[0]][0].length;
+        const firstLen = firstCpLen(s[0]);
         const raw = src.slice(0, o + s.index + firstLen + l);
         const inner = raw.slice(o, -o);
         return { type: 'del', raw, text: inner, tokens: this.lexer.inlineTokens(inner) };
@@ -1038,10 +1120,6 @@ function lastCloserIndex(masked, delim) {
   }
   return delim === '~' ? t : idx[delim];
 }
-function lastDelCloserIndex(masked) {
-  return lastCloserIndex(masked, '~');
-}
-
 // Does the inline source contain a link (used by the masker to decide
 // whether reference labels need masking)?
 function linkInText(src, links) {
@@ -1203,8 +1281,20 @@ class Lexer {
         } else tokens.push(tok);
         continue;
       }
-      if ((tok = this.tokenizer.table(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
-      if ((tok = this.tokenizer.lheading(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
+      // Table guard: the delimiter (2nd line) must contain a '-'; if it
+      // does not, R.table provably cannot match.
+      let tablePossible = false;
+      {
+        const nl1 = src.indexOf('\n');
+        if (nl1 !== -1) {
+          const nl2 = src.indexOf('\n', nl1 + 1);
+          const dash = src.indexOf('-', nl1 + 1);
+          tablePossible = dash !== -1 && (nl2 === -1 || dash < nl2);
+        }
+      }
+      if (tablePossible && (tok = this.tokenizer.table(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
+      // Setext guard: no underline-like line, no setext heading.
+      if (SETEXT_GUARD.test(src) && (tok = this.tokenizer.lheading(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
       if (this.state.top && (tok = this.tokenizer.paragraph(src))) {
         src = src.substring(tok.raw.length);
         const last = tokens[tokens.length - 1];
@@ -1245,14 +1335,18 @@ class Lexer {
     this.state.linkParenPossible = prevParen && src.includes(')');
     const masked = (src.includes('*') || src.includes('_') || src.includes('~'))
       ? maskInline(src, this.tokens.links) : src;
+    // Lazily-filled cache of the last closer index per delimiter, shared
+    // by every emStrong/del attempt in this inline source (the masked
+    // string never changes here, so each delimiter is scanned at most once).
+    const closers = { star: -2, und: -2, tilde: -2 };
     try {
-    return this.inlineTokensInner(src, tokens, masked);
+    return this.inlineTokensInner(src, tokens, masked, closers);
     } finally {
       this.state.linkParenPossible = prevParen;
     }
   }
 
-  inlineTokensInner(src, tokens, masked) {
+  inlineTokensInner(src, tokens, masked, closers) {
     let smallest = Infinity;
     let prevChar = '';
     let keepPrev = false; // true only right after an inlineText token
@@ -1273,7 +1367,7 @@ class Lexer {
         else tokens.push(tok);
         continue;
       }
-      if ((tok = this.tokenizer.emStrong(src, masked, prevChar))) {
+      if ((tok = this.tokenizer.emStrong(src, masked, prevChar, closers))) {
         src = src.substring(tok.raw.length);
         // the masked string must stay aligned with src: re-slice it
         tokens.push(tok);
@@ -1281,7 +1375,7 @@ class Lexer {
       }
       if ((tok = this.tokenizer.codespan(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
       if ((tok = this.tokenizer.br(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
-      if ((tok = this.tokenizer.del(src, masked, prevChar))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
+      if ((tok = this.tokenizer.del(src, masked, prevChar, closers))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
       if ((tok = this.tokenizer.autolink(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
       if (!this.state.inLink && (tok = this.tokenizer.url(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
       if ((tok = this.tokenizer.inlineText(src))) {
